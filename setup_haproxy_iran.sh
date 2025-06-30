@@ -1,24 +1,24 @@
 #!/bin/bash
 
 clear
-echo "🚀 راه‌اندازی خودکار HAProxy"
+echo "🚀 HAProxy Automatic Start"
 echo "==========================="
-echo "این سرور مربوط به کجاست؟"
-echo "1️⃣ ایران (سرور ورودی)"
-echo "2️⃣ خارج (سرور خروجی)"
-read -p "شماره گزینه را وارد کنید [1 یا 2]: " MODE
+echo "Choose 1 or 2"
+echo "1️⃣ IRAN Server"
+echo "2️⃣ Kharej Server"
+read -p "Please choose one option [1 or 2]: " MODE
 
 apt update && apt install -y haproxy ufw dnsutils
 
 cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak 2>/dev/null || true
 
 if [ "$MODE" == "1" ]; then
-  echo "🟢 حالت سرور ایران انتخاب شد."
+  echo "🟢 IRAN Server is selected.."
 
   # دریافت IPهای سرورهای خارجی
   IP_LIST=$(dig +short ssh.vipconfig.ir | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
   if [ -z "$IP_LIST" ]; then
-    echo "❗ خطا: هیچ IP معتبری برای ssh.vipconfig.ir دریافت نشد."
+    echo "Error !!!\nYour SUB Domain no have IP (ssh.vipconfig.ir)"
     exit 1
   fi
 
@@ -78,7 +78,7 @@ EOF
   echo "$IP_LIST"
 
 elif [ "$MODE" == "2" ]; then
-  echo "🔵 حالت سرور خارج انتخاب شد."
+  echo "🔵 Kharej Server is selected."
 
   # تنظیمات HAProxy برای انتقال به localhost
   cat > /etc/haproxy/haproxy.cfg <<EOF
@@ -129,10 +129,10 @@ EOF
   ufw allow 41374/tcp
   ufw allow 42347/tcp
 
-  echo -e "\n✅ سرور خارج آماده اتصال از طریق سرور ایران است."
+  echo -e "\n✅ Kharej Server is ready for connect to IRAN Server."
 
 else
-  echo "❌ ورودی نامعتبر. لطفاً فقط عدد 1 یا 2 را وارد کنید."
+  echo "❌ Input is incorect. Please try again."
   exit 1
 fi
 
