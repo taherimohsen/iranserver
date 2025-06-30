@@ -74,7 +74,7 @@ EOF
   ufw allow 41374/tcp
   ufw allow 42347/tcp
 
-  echo -e "\n✅ سرور ایران با IPهای زیر تنظیم شد:"
+  echo -e "\n✅ Connection IRAN Server set to this IPs:"
   echo "$IP_LIST"
 
 elif [ "$MODE" == "2" ]; then
