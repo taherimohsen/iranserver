@@ -1,31 +1,31 @@
 #!/bin/bash
 
-# تنظیمات پایه
+# Basic settings
 PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
 DEFAULT_PORTS=("4234" "41369" "41374" "42347")
 ALGORITHMS=("source" "roundrobin" "roundrobin" "source")
-STICKY_TIMEOUTS=("4h" "0" "0" "6h")  # زمان پایداری جلسات
+STICKY_TIMEOUTS=("4h" "0" "0" "6h")  # Session persistence times
 
 clear
 echo "🚀 Ultimate HAProxy Tunnel Manager"
 echo "================================"
 
-# انتخاب موقعیت سرور
-read -p "آیا سرور در ایران است؟ (y/n): " is_iran
+# Server location selection
+read -p "Is the server located in Iran? (y/n): " is_iran
 if [ "$is_iran" = "y" ]; then
-  echo "تنظیمات بهینه برای ایران اعمال خواهد شد"
+  echo "Applying optimized settings for Iran"
   SERVER_LOCATION="iran"
 else
-  echo "تنظیمات برای سرور خارج اعمال خواهد شد"
+  echo "Applying settings for foreign servers"
   SERVER_LOCATION="foreign"
 fi
 
-# انتخاب پروتکل‌ها
-echo "لطفا پروتکل‌های مورد نیاز را انتخاب کنید:"
+# Protocol selection
+echo "Please select required protocols:"
 for i in "${!PROTOCOLS[@]}"; do
-  read -p "آیا ${PROTOCOLS[i]} (پورت ${DEFAULT_PORTS[i]}) را فعال کنیم؟ (y/n): " enable_proto
+  read -p "Enable ${PROTOCOLS[i]} (port ${DEFAULT_PORTS[i]})? (y/n): " enable_proto
   if [ "$enable_proto" = "y" ]; then
-    read -p "پورت مورد نظر برای ${PROTOCOLS[i]} (پیشفرض ${DEFAULT_PORTS[i]}): " custom_port
+    read -p "Custom port for ${PROTOCOLS[i]} (default ${DEFAULT_PORTS[i]}): " custom_port
     PORTS[i]=${custom_port:-${DEFAULT_PORTS[i]}}
     ENABLED_PROTOCOLS+=("${PROTOCOLS[i]}")
   else
@@ -33,21 +33,21 @@ for i in "${!PROTOCOLS[@]}"; do
   fi
 done
 
-# دریافت سرورهای بکند
-read -p "آدرس سرورهای بکند را وارد کنید (با کاما جدا کنید، یا برای استفاده از ssh.vipconfig.ir خالی بگذارید): " backend_servers
+# Backend servers input
+read -p "Enter backend server IPs (comma separated, leave empty for ssh.vipconfig.ir): " backend_servers
 if [ -z "$backend_servers" ]; then
   if [ "$SERVER_LOCATION" = "iran" ]; then
     BACKEND_SERVERS=($(dig +short ssh.vipconfig.ir))
-    echo "استفاده از سرورهای پیشفرض ایرانی: ${BACKEND_SERVERS[*]}"
+    echo "Using default Iranian servers: ${BACKEND_SERVERS[*]}"
   else
-    echo "خطا: برای سرورهای خارجی باید آدرس سرورها را وارد کنید"
+    echo "Error: For foreign servers you must enter server addresses"
     exit 1
   fi
 else
   IFS=',' read -ra BACKEND_SERVERS <<< "$backend_servers"
 fi
 
-# تابع بررسی سلامت سرورها
+# Server health check function
 check_server_health() {
   local ip=$1
   local port=$2
@@ -55,7 +55,7 @@ check_server_health() {
   return $?
 }
 
-# تولید کانفیگ
+# Generate HAProxy config
 generate_config() {
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
@@ -86,7 +86,7 @@ backend ${PROTOCOLS[i]}_back
     balance ${ALGORITHMS[i]}
 EOF
 
-      # تنظیمات پایداری جلسه برای SSH و OpenVPN
+      # Session persistence for SSH and OpenVPN
       if [ "${STICKY_TIMEOUTS[i]}" != "0" ]; then
         cat >> /etc/haproxy/haproxy.cfg <<EOF
     stick-table type ip size 200k expire ${STICKY_TIMEOUTS[i]}
@@ -94,36 +94,48 @@ EOF
 EOF
       fi
 
-      # اضافه کردن سرورها
+      # Add only active servers
+      active_servers=0
       for ip in "${BACKEND_SERVERS[@]}"; do
-        echo "    server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check" >> /etc/haproxy/haproxy.cfg
+        if check_server_health "$ip" "${PORTS[i]}"; then
+          echo "    server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check" >> /etc/haproxy/haproxy.cfg
+          active_servers=$((active_servers+1))
+        else
+          echo "    #server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check  # INACTIVE" >> /etc/haproxy/haproxy.cfg
+        fi
       done
+      
+      # Add fallback server if no active servers found
+      if [ $active_servers -eq 0 ]; then
+        echo "    server ${PROTOCOLS[i]}_fallback 127.0.0.1:${PORTS[i]} backup" >> /etc/haproxy/haproxy.cfg
+        echo "⚠️ Warning: No active servers found for ${PROTOCOLS[i]}, added fallback server"
+      fi
 
       ufw allow "${PORTS[i]}"/tcp
     fi
   done
 }
 
-# تابع ریست و بررسی سلامت
+# Reset and health check function
 reset_and_check() {
-  echo "🔄 در حال ریست تونل‌ها و بررسی سرورها..."
+  echo "🔄 Resetting tunnels and checking servers..."
 
-  # پاکسازی جلسات
+  # Clear sessions
   for proto in "${ENABLED_PROTOCOLS[@]}"; do
     if [[ "$proto" == "SSH" || "$proto" == "OpenVPN" ]]; then
       echo "clear table ${proto}_back" | socat /var/run/haproxy.sock stdio
     fi
   done
 
-  # بررسی سلامت سرورها و به‌روزرسانی config
+  # Check server health and update config
   for i in "${!PROTOCOLS[@]}"; do
     if [ -n "${PORTS[i]}" ]; then
       for ip in "${BACKEND_SERVERS[@]}"; do
         if ! check_server_health "$ip" "${PORTS[i]}"; then
-          echo "🚨 سرور ${PROTOCOLS[i]}_${ip//./_} غیرفعال است، در حال غیرفعال کردن..."
+          echo "🚨 Server ${PROTOCOLS[i]}_${ip//./_} is OFFLINE, disabling..."
           sed -i "/server ${PROTOCOLS[i]}_${ip//./_}/s/^/#/" /etc/haproxy/haproxy.cfg
         else
-          echo "✅ سرور ${PROTOCOLS[i]}_${ip//./_} فعال است"
+          echo "✅ Server ${PROTOCOLS[i]}_${ip//./_} is ONLINE"
           sed -i "/#server ${PROTOCOLS[i]}_${ip//./_}/s/^#//" /etc/haproxy/haproxy.cfg
         fi
       done
@@ -133,9 +145,9 @@ reset_and_check() {
   systemctl restart haproxy
 }
 
-# تنظیم سرویس‌های خودکار
+# Setup automatic services
 setup_services() {
-  # سرویس ریست 6 ساعته
+  # 6-hour reset service
   cat > /etc/systemd/system/haproxy-reset.service <<EOF
 [Unit]
 Description=HAProxy Reset and Health Check
@@ -146,7 +158,7 @@ Type=oneshot
 ExecStart=/bin/bash -c '$(declare -f reset_and_check); reset_and_check'
 EOF
 
-  # تایمر 6 ساعته
+  # 6-hour timer
   cat > /etc/systemd/system/haproxy-reset.timer <<EOF
 [Unit]
 Description=HAProxy Reset Timer
@@ -160,7 +172,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-  # سرویس راه‌اندازی پس از ریستارت
+  # Autostart service
   cat > /etc/systemd/system/haproxy-autostart.service <<EOF
 [Unit]
 Description=HAProxy Auto Start
@@ -179,26 +191,26 @@ EOF
   systemctl start haproxy-reset.timer
 }
 
-# نصب و راه‌اندازی
-echo "در حال نصب پیش‌نیازها..."
+# Installation and setup
+echo "Installing prerequisites..."
 apt update && apt install -y haproxy ufw netcat dnsutils
 
-echo "در حال تولید پیکربندی..."
+echo "Generating configuration..."
 generate_config
 
-echo "در حال تنظیم سرویس‌های خودکار..."
+echo "Setting up automatic services..."
 setup_services
 
 systemctl restart haproxy
 systemctl enable haproxy
 ufw --force enable
 
-echo -e "\n🎉 پیکربندی با موفقیت انجام شد!"
-echo "📋 پروتکل‌های فعال:"
+echo -e "\n🎉 Configuration completed successfully!"
+echo "📋 Active protocols:"
 for i in "${!PROTOCOLS[@]}"; do
   if [ -n "${PORTS[i]}" ]; then
-    echo "  ${PROTOCOLS[i]}:${PORTS[i]} | الگوریتم: ${ALGORITHMS[i]} | پایداری: ${STICKY_TIMEOUTS[i]}"
+    echo "  ${PROTOCOLS[i]}:${PORTS[i]} | Algorithm:${ALGORITHMS[i]} | Sticky:${STICKY_TIMEOUTS[i]}"
   fi
 done
-echo -e "\n🔁 ریست خودکار هر 6 ساعت فعال شد"
-echo "🔄 راه‌اندازی خودکار پس از ریستارت فعال شد"
+echo -e "\n🔁 Auto-reset every 6 hours enabled"
+echo "🔄 Auto-start after reboot enabled"
