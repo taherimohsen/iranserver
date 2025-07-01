@@ -1,200 +1,152 @@
 #!/bin/bash
 
+# تنظیمات پایه
+PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
+PORTS=("4234" "41369" "41374" "42347")
+ALGORITHMS=("source" "roundrobin" "roundrobin" "source")
+STICKY_TIMEOUTS=("4h" "0" "0" "6h")  # زمان پایداری جلسات
+
 clear
-echo "🚀 HAProxy Advanced Tunnel Manager"
+echo "🚀 Ultimate HAProxy Tunnel Manager"
 echo "================================"
 
-# Correct port assignments
-PORTS=("4234" "41369" "41374" "42347")
-PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
-SERVICES=("ssh" "vless" "vmess" "openvpn")
-
-# Function to check port status
-check_port() {
-  nc -zvw3 $1 $2 &>/dev/null
-  if [ $? -eq 0 ]; then
-    echo -e "[🟢] $1:$2"
-    return 0
-  else
-    echo -e "[🔴] $1:$2"
-    return 1
-  fi
+# تابع بررسی سلامت سرورها
+check_server_health() {
+  local ip=$1
+  local port=$2
+  nc -z -w 3 "$ip" "$port" &>/dev/null
+  return $?
 }
 
-# Function to validate IP list
-validate_ips() {
-  local ip_list=$1
-  for ip in $ip_list; do
-    if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "❌ Invalid IP detected: $ip"
-      return 1
+# تولید کانفیگ ایران
+generate_config() {
+  cat > /etc/haproxy/haproxy.cfg <<EOF
+global
+    log /dev/log local0 info
+    maxconn 10000
+    tune.ssl.default-dh-param 2048
+    daemon
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 1h
+    timeout server 1h
+EOF
+
+  for i in "${!PROTOCOLS[@]}"; do
+    cat >> /etc/haproxy/haproxy.cfg <<EOF
+
+frontend ${PROTOCOLS[i]}_front
+    bind *:${PORTS[i]}
+    default_backend ${PROTOCOLS[i]}_back
+
+backend ${PROTOCOLS[i]}_back
+    mode tcp
+    balance ${ALGORITHMS[i]}
+EOF
+
+    # تنظیمات پایداری جلسه برای SSH و OpenVPN
+    if [ "${STICKY_TIMEOUTS[i]}" != "0" ]; then
+      cat >> /etc/haproxy/haproxy.cfg <<EOF
+    stick-table type ip size 200k expire ${STICKY_TIMEOUTS[i]}
+    stick on src
+EOF
     fi
+
+    # اضافه کردن سرورها (بدون چک سلامت اولیه)
+    for ip in $(dig +short ssh.vipconfig.ir); do
+      echo "    server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check" >> /etc/haproxy/haproxy.cfg
+    done
+    
+    ufw allow "${PORTS[i]}"/tcp
   done
-  return 0
 }
 
-# Main menu
-echo "1️⃣ IRAN Server (Load Balancer)"
-echo "2️⃣ Kharej Server (Backend)"
-read -p "Select server type [1/2]: " SERVER_TYPE
+# تابع ریست و بررسی سلامت
+reset_and_check() {
+  echo "🔄 Resetting tunnels and checking servers..."
+  
+  # پاکسازی جلسات
+  echo "clear table SSH_back" | socat /var/run/haproxy.sock stdio
+  echo "clear table OpenVPN_back" | socat /var/run/haproxy.sock stdio
+  
+  # بررسی سلامت سرورها و به‌روزرسانی config
+  for i in "${!PROTOCOLS[@]}"; do
+    for ip in $(dig +short ssh.vipconfig.ir); do
+      if ! check_server_health "$ip" "${PORTS[i]}"; then
+        echo "🚨 Server ${PROTOCOLS[i]}_${ip//./_} is OFFLINE, disabling..."
+        sed -i "/server ${PROTOCOLS[i]}_${ip//./_}/s/^/#/" /etc/haproxy/haproxy.cfg
+      else
+        echo "✅ Server ${PROTOCOLS[i]}_${ip//./_} is ONLINE"
+        sed -i "/#server ${PROTOCOLS[i]}_${ip//./_}/s/^#//" /etc/haproxy/haproxy.cfg
+      fi
+    done
+  done
+  
+  systemctl restart haproxy
+}
 
-# Install required packages
+# تنظیم سرویس‌های خودکار
+setup_services() {
+  # سرویس ریست 6 ساعته
+  cat > /etc/systemd/system/haproxy-reset.service <<EOF
+[Unit]
+Description=HAProxy Reset and Health Check
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '$(declare -f reset_and_check); reset_and_check'
+EOF
+
+  # تایمر 6 ساعته
+  cat > /etc/systemd/system/haproxy-reset.timer <<EOF
+[Unit]
+Description=HAProxy Reset Timer
+
+[Timer]
+OnBootSec=6h
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # سرویس راه‌اندازی پس از ریستارت
+  cat > /etc/systemd/system/haproxy-autostart.service <<EOF
+[Unit]
+Description=HAProxy Auto Start
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart haproxy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable haproxy-reset.timer haproxy-autostart.service
+  systemctl start haproxy-reset.timer
+}
+
+# نصب و راه‌اندازی
 apt update && apt install -y haproxy ufw netcat dnsutils
-
-if [ "$SERVER_TYPE" == "1" ]; then
-  # IRAN Server Configuration
-  echo -e "\n🔵 IRAN Server Mode (Load Balancer)"
-  
-  # Get Kharej IPs
-  IP_LIST=$(dig +short ssh.vipconfig.ir | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
-  if ! validate_ips "$IP_LIST"; then
-    exit 1
-  fi
-  
-  echo -e "\n🔎 Checking Kharej servers status..."
-  for ip in $IP_LIST; do
-    echo -e "\n📡 Checking $ip:"
-    for port in "${PORTS[@]}"; do
-      check_port $ip $port
-    done
-  done
-
-  # Protocol selection
-  echo -e "\n🔘 Select protocols to enable (comma separated):"
-  for i in "${!PORTS[@]}"; do
-    echo "$((i+1))) ${PROTOCOLS[i]} (${PORTS[i]})"
-  done
-  echo "$(( ${#PORTS[@]} + 1 ))) All protocols"
-  read -p "Enter choices (e.g. 1,3): " PROTOCOL_CHOICES
-
-  # Process selections
-  SELECTED_PORTS=()
-  if [[ $PROTOCOL_CHOICES == *$(( ${#PORTS[@]} + 1 ))* ]]; then
-    SELECTED_PORTS=("${PORTS[@]}")
-  else
-    IFS=',' read -ra CHOICES <<< "$PROTOCOL_CHOICES"
-    for choice in "${CHOICES[@]}"; do
-      index=$((choice-1))
-      [ $index -ge 0 ] && [ $index -lt ${#PORTS[@]} ] && SELECTED_PORTS+=("${PORTS[index]}")
-    done
-  fi
-
-  # Generate HAProxy config
-  cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
-  cat > /etc/haproxy/haproxy.cfg <<EOF
-global
-    log /dev/log local0
-    maxconn 10000
-    daemon
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5s
-    timeout client 1m
-    timeout server 1m
-EOF
-
-  # Add selected frontends and backends
-  for port in "${SELECTED_PORTS[@]}"; do
-    for i in "${!PORTS[@]}"; do
-      if [ "${PORTS[i]}" == "$port" ]; then
-        proto=${PROTOCOLS[i]}
-        service=${SERVICES[i]}
-        break
-      fi
-    done
-    
-    cat >> /etc/haproxy/haproxy.cfg <<EOF
-
-frontend ${proto}_front
-    bind *:$port
-    default_backend ${proto}_back
-
-backend ${proto}_back
-    mode tcp
-    balance leastconn
-    option tcp-check
-    tcp-check connect port $port
-    default-server inter 2s fall 2 rise 1 check
-EOF
-
-    for ip in $IP_LIST; do
-      if check_port $ip $port; then
-        echo "    server ${proto}_$(echo $ip | tr '.' '_') $ip:$port check" >> /etc/haproxy/haproxy.cfg
-      fi
-    done
-    
-    ufw allow $port/tcp
-    echo "✅ ${proto} (${port}) enabled"
-  done
-
-else
-  # Kharej Server Configuration
-  echo -e "\n🔵 Kharej Server Mode (Backend)"
-  
-  # Protocol selection
-  echo -e "\n🔘 Select installed protocols (comma separated):"
-  for i in "${!PORTS[@]}"; do
-    echo "$((i+1))) ${PROTOCOLS[i]} (${PORTS[i]})"
-  done
-  read -p "Enter choices (e.g. 1,3): " PROTOCOL_CHOICES
-
-  # Process selections
-  SELECTED_PORTS=()
-  IFS=',' read -ra CHOICES <<< "$PROTOCOL_CHOICES"
-  for choice in "${CHOICES[@]}"; do
-    index=$((choice-1))
-    [ $index -ge 0 ] && [ $index -lt ${#PORTS[@]} ] && SELECTED_PORTS+=("${PORTS[index]}")
-  done
-
-  # Generate HAProxy config
-  cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
-  cat > /etc/haproxy/haproxy.cfg <<EOF
-global
-    log /dev/log local0
-    maxconn 10000
-    daemon
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5s
-    timeout client 1m
-    timeout server 1m
-EOF
-
-  # Add selected frontends and backends
-  for port in "${SELECTED_PORTS[@]}"; do
-    for i in "${!PORTS[@]}"; do
-      if [ "${PORTS[i]}" == "$port" ]; then
-        proto=${PROTOCOLS[i]}
-        service=${SERVICES[i]}
-        break
-      fi
-    done
-    
-    cat >> /etc/haproxy/haproxy.cfg <<EOF
-
-frontend ${proto}_front
-    bind *:$port
-    default_backend ${proto}_back
-
-backend ${proto}_back
-    server local_${service} 127.0.0.1:$port
-EOF
-    
-    ufw allow $port/tcp
-    echo "✅ ${proto} (${port}) → Local service"
-  done
-fi
-
-# Restart services
+generate_config
+setup_services
 systemctl restart haproxy
 systemctl enable haproxy
 ufw --force enable
 
-echo -e "\n🎉 Tunnel configuration completed!"
-echo "🔍 Check status with: systemctl status haproxy"
+echo -e "\n🎉 Configuration Completed!"
+echo "📋 Active Protocols:"
+for i in "${!PROTOCOLS[@]}"; do
+  echo "  ${PROTOCOLS[i]}:${PORTS[i]} | Algorithm:${ALGORITHMS[i]} | Sticky:${STICKY_TIMEOUTS[i]}"
+done
+echo -e "\n🔁 Auto reset every 6 hours enabled"
+echo "🔄 Auto-start after reboot enabled"
