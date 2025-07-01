@@ -1,86 +1,86 @@
 #!/bin/bash
 
 clear
-echo "🚀 HAProxy Automatic Start"
-echo "==========================="
-echo "Choose 1 or 2"
-echo "1️⃣ IRAN Server"
-echo "2️⃣ Kharej Server"
-read -p "Please choose one option [1 or 2]: " MODE
+echo "🚀 HAProxy Advanced Tunnel Manager"
+echo "================================"
 
-apt update && apt install -y haproxy ufw dnsutils
+# Correct port assignments
+PORTS=("4234" "41369" "41374" "42347")
+PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
+SERVICES=("ssh" "vless" "vmess" "openvpn")
 
-cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak 2>/dev/null || true
+# Function to check port status
+check_port() {
+  nc -zvw3 $1 $2 &>/dev/null
+  if [ $? -eq 0 ]; then
+    echo -e "[🟢] $1:$2"
+    return 0
+  else
+    echo -e "[🔴] $1:$2"
+    return 1
+  fi
+}
 
-if [ "$MODE" == "1" ]; then
-  echo "🟢 IRAN Server is selected.."
+# Function to validate IP list
+validate_ips() {
+  local ip_list=$1
+  for ip in $ip_list; do
+    if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "❌ Invalid IP detected: $ip"
+      return 1
+    fi
+  done
+  return 0
+}
 
-  # دریافت IPهای سرورهای خارجی
+# Main menu
+echo "1️⃣ IRAN Server (Load Balancer)"
+echo "2️⃣ Kharej Server (Backend)"
+read -p "Select server type [1/2]: " SERVER_TYPE
+
+# Install required packages
+apt update && apt install -y haproxy ufw netcat dnsutils
+
+if [ "$SERVER_TYPE" == "1" ]; then
+  # IRAN Server Configuration
+  echo -e "\n🔵 IRAN Server Mode (Load Balancer)"
+  
+  # Get Kharej IPs
   IP_LIST=$(dig +short ssh.vipconfig.ir | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
-  if [ -z "$IP_LIST" ]; then
-    echo "Error !!!\nYour SUB Domain no have IP (ssh.vipconfig.ir)"
+  if ! validate_ips "$IP_LIST"; then
     exit 1
   fi
-
-  # تنظیمات HAProxy برای فوروارد به خارج
-  cat > /etc/haproxy/haproxy.cfg <<EOF
-global
-    log /dev/log local0
-    maxconn 10000
-    daemon
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5s
-    timeout client 1m
-    timeout server 1m
-
-frontend ssh_in
-    bind *:4234
-    default_backend ssh_out
-
-frontend vmess_in
-    bind *:41369
-    default_backend vmess_out
-
-frontend vless_in
-    bind *:41374
-    default_backend vless_out
-
-frontend openvpn_in
-    bind *:42347
-    default_backend openvpn_out
-EOF
-
-  for PORT in 4234 41369 41374 42347; do
-    cat >> /etc/haproxy/haproxy.cfg <<EOF
-
-backend ${PORT}_out
-    mode tcp
-    balance first
-    option tcp-check
-    tcp-check connect port $PORT
-    default-server inter 2s fall 2 rise 1 check
-EOF
-    for IP in $IP_LIST; do
-      echo "    server srv_${PORT}_$(echo $IP | tr '.' '_') ${IP}:$PORT check" >> /etc/haproxy/haproxy.cfg
+  
+  echo -e "\n🔎 Checking Kharej servers status..."
+  for ip in $IP_LIST; do
+    echo -e "\n📡 Checking $ip:"
+    for port in "${PORTS[@]}"; do
+      check_port $ip $port
     done
   done
 
-  ufw allow 4234/tcp
-  ufw allow 41369/tcp
-  ufw allow 41374/tcp
-  ufw allow 42347/tcp
+  # Protocol selection
+  echo -e "\n🔘 Select protocols to enable (comma separated):"
+  for i in "${!PORTS[@]}"; do
+    echo "$((i+1))) ${PROTOCOLS[i]} (${PORTS[i]})"
+  done
+  echo "$(( ${#PORTS[@]} + 1 ))) All protocols"
+  read -p "Enter choices (e.g. 1,3): " PROTOCOL_CHOICES
 
-  echo -e "\n✅ Connection IRAN Server set to this IPs:"
-  echo "$IP_LIST"
+  # Process selections
+  SELECTED_PORTS=()
+  if [[ $PROTOCOL_CHOICES == *$(( ${#PORTS[@]} + 1 ))* ]]; then
+    SELECTED_PORTS=("${PORTS[@]}")
+  else
+    IFS=',' read -ra CHOICES <<< "$PROTOCOL_CHOICES"
+    for choice in "${CHOICES[@]}"; do
+      index=$((choice-1))
+      [ $index -ge 0 ] && [ $index -lt ${#PORTS[@]} ] && SELECTED_PORTS+=("${PORTS[index]}")
+    done
+  fi
 
-elif [ "$MODE" == "2" ]; then
-  echo "🔵 Kharej Server is selected."
-
-  # تنظیمات HAProxy برای انتقال به localhost
+  # Generate HAProxy config
+  cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
     log /dev/log local0
@@ -94,47 +94,107 @@ defaults
     timeout connect 5s
     timeout client 1m
     timeout server 1m
-
-frontend ssh_in
-    bind *:4234
-    default_backend ssh_local
-
-frontend vmess_in
-    bind *:41369
-    default_backend vmess_local
-
-frontend vless_in
-    bind *:41374
-    default_backend vless_local
-
-frontend openvpn_in
-    bind *:42347
-    default_backend openvpn_local
-
-backend ssh_local
-    server local_ssh 127.0.0.1:22
-
-backend vmess_local
-    server local_vmess 127.0.0.1:41369
-
-backend vless_local
-    server local_vless 127.0.0.1:41374
-
-backend openvpn_local
-    server local_openvpn 127.0.0.1:42347
 EOF
 
-  ufw allow 4234/tcp
-  ufw allow 41369/tcp
-  ufw allow 41374/tcp
-  ufw allow 42347/tcp
+  # Add selected frontends and backends
+  for port in "${SELECTED_PORTS[@]}"; do
+    for i in "${!PORTS[@]}"; do
+      if [ "${PORTS[i]}" == "$port" ]; then
+        proto=${PROTOCOLS[i]}
+        service=${SERVICES[i]}
+        break
+      fi
+    done
+    
+    cat >> /etc/haproxy/haproxy.cfg <<EOF
 
-  echo -e "\n✅ Kharej Server is ready for connect to IRAN Server."
+frontend ${proto}_front
+    bind *:$port
+    default_backend ${proto}_back
+
+backend ${proto}_back
+    mode tcp
+    balance leastconn
+    option tcp-check
+    tcp-check connect port $port
+    default-server inter 2s fall 2 rise 1 check
+EOF
+
+    for ip in $IP_LIST; do
+      if check_port $ip $port; then
+        echo "    server ${proto}_$(echo $ip | tr '.' '_') $ip:$port check" >> /etc/haproxy/haproxy.cfg
+      fi
+    done
+    
+    ufw allow $port/tcp
+    echo "✅ ${proto} (${port}) enabled"
+  done
 
 else
-  echo "❌ Input is incorect. Please try again."
-  exit 1
+  # Kharej Server Configuration
+  echo -e "\n🔵 Kharej Server Mode (Backend)"
+  
+  # Protocol selection
+  echo -e "\n🔘 Select installed protocols (comma separated):"
+  for i in "${!PORTS[@]}"; do
+    echo "$((i+1))) ${PROTOCOLS[i]} (${PORTS[i]})"
+  done
+  read -p "Enter choices (e.g. 1,3): " PROTOCOL_CHOICES
+
+  # Process selections
+  SELECTED_PORTS=()
+  IFS=',' read -ra CHOICES <<< "$PROTOCOL_CHOICES"
+  for choice in "${CHOICES[@]}"; do
+    index=$((choice-1))
+    [ $index -ge 0 ] && [ $index -lt ${#PORTS[@]} ] && SELECTED_PORTS+=("${PORTS[index]}")
+  done
+
+  # Generate HAProxy config
+  cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
+  cat > /etc/haproxy/haproxy.cfg <<EOF
+global
+    log /dev/log local0
+    maxconn 10000
+    daemon
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 1m
+    timeout server 1m
+EOF
+
+  # Add selected frontends and backends
+  for port in "${SELECTED_PORTS[@]}"; do
+    for i in "${!PORTS[@]}"; do
+      if [ "${PORTS[i]}" == "$port" ]; then
+        proto=${PROTOCOLS[i]}
+        service=${SERVICES[i]}
+        break
+      fi
+    done
+    
+    cat >> /etc/haproxy/haproxy.cfg <<EOF
+
+frontend ${proto}_front
+    bind *:$port
+    default_backend ${proto}_back
+
+backend ${proto}_back
+    server local_${service} 127.0.0.1:$port
+EOF
+    
+    ufw allow $port/tcp
+    echo "✅ ${proto} (${port}) → Local service"
+  done
 fi
 
+# Restart services
 systemctl restart haproxy
 systemctl enable haproxy
+ufw --force enable
+
+echo -e "\n🎉 Tunnel configuration completed!"
+echo "🔍 Check status with: systemctl status haproxy"
