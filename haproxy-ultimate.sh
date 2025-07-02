@@ -1,343 +1,220 @@
 #!/bin/bash
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
 # تنظیمات پایه
 PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
 DEFAULT_PORTS=("4234" "41369" "41374" "42347")
 ALGORITHMS=("source" "roundrobin" "roundrobin" "source")
-STICKY_TIMEOUTS=("4h" "0" "0" "8h")
+STICKY_TIMEOUTS=("4h" "0" "0" "8h")  # زمان ماندگاری سشن
 
-# تابع نمایش هدر اسکریپت
-show_header() {
-  clear
-  echo -e "${GREEN}"
-  echo "   _    _    _    _    _    _    _    _    _    _  "
-  echo "  / \  / \  / \  / \  / \  / \  / \  / \  / \  / \ "
-  echo " ( H )( A )( P )( R )( O )( X )( Y )( T )( M )( G )"
-  echo "  \_/  \_/  \_/  \_/  \_/  \_/  \_/  \_/  \_/  \_/ "
-  echo -e "${NC}"
-  echo -e "${GREEN}🚀 Ultimate HAProxy Tunnel Manager - Stable Version${NC}"
-  echo -e "${GREEN}===============================================${NC}"
-  echo -e "${YELLOW}📅 Created: $(date)${NC}"
-  echo -e "${YELLOW}🖥️  OS: $(lsb_release -d | cut -f2-)${NC}"
-  echo -e "${YELLOW}🌐 IP: $(curl -s ifconfig.me)${NC}\n"
-}
+clear
+echo "🚀 Ultimate HAProxy Tunnel Manager - Fixed Version"
+echo "================================================"
 
-# تابع بررسی دسترسی root
-check_root() {
-  if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}❌ Error: This script must be run as root${NC}"
+# انتخاب موقعیت سرور
+read -p "Is the server located in Iran? (y/n): " is_iran
+if [ "$is_iran" = "y" ]; then
+  echo "Applying optimized settings for Iran"
+  SERVER_LOCATION="iran"
+else
+  echo "Applying settings for foreign servers"
+  SERVER_LOCATION="foreign"
+fi
+
+# انتخاب پروتکل‌ها
+echo "Please select required protocols:"
+for i in "${!PROTOCOLS[@]}"; do
+  read -p "Enable ${PROTOCOLS[i]} (port ${DEFAULT_PORTS[i]})? (y/n): " enable_proto
+  if [ "$enable_proto" = "y" ]; then
+    while true; do
+      read -p "Custom port for ${PROTOCOLS[i]} (default ${DEFAULT_PORTS[i]}): " custom_port
+      port=${custom_port:-${DEFAULT_PORTS[i]}}
+      if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+        PORTS[i]=$port
+        break
+      else
+        echo "❌ Invalid port! Must be between 1024 and 65535"
+      fi
+    done
+    
+    # انتخاب پروتکل برای OpenVPN
+    if [ "${PROTOCOLS[i]}" = "OpenVPN" ]; then
+      echo "Select OpenVPN protocol:"
+      echo "1) TCP (Recommended)"
+      echo "2) UDP (High performance)"
+      read -p "Your choice [1-2]: " proto_choice
+      case $proto_choice in
+        2) PROTOCOL_TYPES[i]="udp" ;;
+        *) PROTOCOL_TYPES[i]="tcp" ;;
+      esac
+    else
+      PROTOCOL_TYPES[i]="tcp"
+    fi
+    
+    ENABLED_PROTOCOLS+=("${PROTOCOLS[i]}")
+  else
+    PORTS[i]=""
+    PROTOCOL_TYPES[i]=""
+  fi
+done
+
+# دریافت سرورهای بک‌اند
+read -p "Enter backend server IPs/Domains (comma separated, leave empty for default): " backend_servers
+if [ -z "$backend_servers" ]; then
+  if [ "$SERVER_LOCATION" = "iran" ]; then
+    BACKEND_SERVERS=($(dig +short ssh.vipconfig.ir))
+    echo "Using default Iranian servers: ${BACKEND_SERVERS[*]}"
+  else
+    echo "Error: For foreign servers you must enter server addresses"
     exit 1
   fi
-}
-
-# تابع بررسی نسخه اوبونتو
-check_ubuntu_version() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    if [ "$ID" = "ubuntu" ]; then
-      if [ "$(echo "$VERSION_ID" | cut -d'.' -f1)" -lt 22 ]; then
-        echo -e "${RED}❌ Error: This script requires Ubuntu 22.04 or higher${NC}"
-        exit 1
-      fi
+else
+  IFS=',' read -ra BACKEND_SERVERS <<< "$backend_servers"
+  
+  # Resolve domains to IPs
+  RESOLVED_SERVERS=()
+  for server in "${BACKEND_SERVERS[@]}"; do
+    if [[ $server =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      RESOLVED_SERVERS+=("$server")
     else
-      echo -e "${YELLOW}⚠️ Warning: This script is optimized for Ubuntu, but may work on other Debian-based systems${NC}"
-      sleep 2
-    fi
-  else
-    echo -e "${YELLOW}⚠️ Warning: Could not detect OS version, continuing anyway...${NC}"
-    sleep 2
-  fi
-}
-
-# تابع اعتبارسنجی پورت
-validate_port() {
-  local port=$1
-  if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
-    echo -e "${RED}❌ Error: Invalid port number! Must be between 1024 and 65535${NC}"
-    return 1
-  fi
-  
-  # بررسی اینکه پورت قبلا استفاده نشده باشد
-  if ss -tuln | grep -q ":$port "; then
-    echo -e "${RED}❌ Error: Port $port is already in use${NC}"
-    return 1
-  fi
-  
-  return 0
-}
-
-# تابع نصب HAProxy
-install_haproxy() {
-  if ! command -v haproxy &> /dev/null; then
-    echo -e "\n${YELLOW}🔧 Installing HAProxy...${NC}"
-    apt-get update > /dev/null 2>&1
-    apt-get install -y haproxy > /dev/null 2>&1
-    
-    # برای پشتیبانی از UDP در HAProxy نسخه 2.4+
-    if ! haproxy -v | grep -q "2.4"; then
-      echo -e "${YELLOW}⚠️ Upgrading HAProxy to version 2.4+ for UDP support${NC}"
-      add-apt-repository -y ppa:vbernat/haproxy-2.4 > /dev/null 2>&1
-      apt-get update > /dev/null 2>&1
-      apt-get install -y haproxy=2.4.* > /dev/null 2>&1
-    fi
-    
-    echo -e "${GREEN}✅ HAProxy installed successfully${NC}"
-  else
-    echo -e "${GREEN}✅ HAProxy is already installed (Version: $(haproxy -v | head -n1))${NC}"
-  fi
-}
-
-# تابع نصب پیش‌نیازها
-install_deps() {
-  echo -e "\n${YELLOW}🔧 Installing dependencies...${NC}"
-  apt-get update > /dev/null 2>&1
-  apt-get install -y ufw netcat-openbsd dnsutils curl > /dev/null 2>&1
-  echo -e "${GREEN}✅ Dependencies installed successfully${NC}"
-}
-
-# تابع پیکربندی پروتکل‌ها
-configure_protocols() {
-  declare -A CONFIG
-  for i in "${!PROTOCOLS[@]}"; do
-    echo -e "\n${YELLOW}🔘 ${PROTOCOLS[i]} Configuration${NC}"
-    
-    # فعال کردن پروتکل
-    while true; do
-      read -p "Enable ${PROTOCOLS[i]}? (y/n) [y]: " enabled
-      enabled=${enabled:-y}
-      if [[ "$enabled" =~ ^[YyNn]$ ]]; then
-        break
-      fi
-      echo -e "${RED}❌ Invalid input! Please enter y or n${NC}"
-    done
-    
-    if [[ "$enabled" =~ ^[Yy] ]]; then
-      # تنظیم پورت
-      while true; do
-        read -p "Port for ${PROTOCOLS[i]} [${DEFAULT_PORTS[i]}]: " port
-        port=${port:-${DEFAULT_PORTS[i]}}
-        if validate_port "$port"; then
-          break
-        fi
-      done
-      
-      # تنظیم پروتکل برای OpenVPN
-      if [ "${PROTOCOLS[i]}" == "OpenVPN" ]; then
-        echo -e "${YELLOW}🔘 OpenVPN Protocol Selection${NC}"
-        while true; do
-          echo "1) TCP (Recommended for stability)"
-          echo "2) UDP (Better performance)"
-          read -p "Choose protocol [1-2] (default:1): " proto_choice
-          proto_choice=${proto_choice:-1}
-          case $proto_choice in
-            1) proto="tcp"; break ;;
-            2) proto="udp"; break ;;
-            *) echo -e "${RED}❌ Invalid choice! Please enter 1 or 2${NC}" ;;
-          esac
-        done
+      resolved_ips=($(dig +short "$server"))
+      if [ ${#resolved_ips[@]} -eq 0 ]; then
+        echo "⚠️ Could not resolve: $server"
       else
-        proto="tcp"
+        RESOLVED_SERVERS+=("${resolved_ips[@]}")
       fi
-      
-      CONFIG["${PROTOCOLS[i]},enabled"]=1
-      CONFIG["${PROTOCOLS[i]},port"]=$port
-      CONFIG["${PROTOCOLS[i]},proto"]=$proto
-      echo -e "${GREEN}✅ ${PROTOCOLS[i]} configured on port ${port}/${proto}${NC}"
-    else
-      CONFIG["${PROTOCOLS[i]},enabled"]=0
-      echo -e "${YELLOW}⚠️ ${PROTOCOLS[i]} disabled${NC}"
     fi
   done
-}
+  BACKEND_SERVERS=("${RESOLVED_SERVERS[@]}")
+fi
 
-# تابع دریافت سرورهای بک‌اند
-get_backend_servers() {
-  echo -e "\n${YELLOW}🌐 Backend Server Configuration${NC}"
-  echo "Enter backend servers (IP or domain, comma separated)"
-  echo "Example: 1.1.1.1,2.2.2.2 or vpn1.example.com,vpn2.example.com"
+# بررسی سلامت سرورها
+check_server_health() {
+  local ip=$1
+  local port=$2
+  local proto=$3
   
-  while true; do
-    read -p "Backend servers: " backend_input
-    if [ -z "$backend_input" ]; then
-      echo -e "${RED}❌ Error: Backend servers cannot be empty!${NC}"
-      continue
-    fi
-    
-    IFS=',' read -ra SERVER_LIST <<< "$backend_input"
-    BACKEND_IPS=()
-    INVALID_SERVERS=()
-    
-    for server in "${SERVER_LIST[@]}"; do
-      server=$(echo "$server" | xargs) # حذف فاصله‌های اضافی
-      if [[ $server =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        BACKEND_IPS+=("$server")
-      else
-        # بررسی دامنه
-        resolved_ips=($(dig +short "$server" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'))
-        if [ ${#resolved_ips[@]} -eq 0 ]; then
-          INVALID_SERVERS+=("$server")
-        else
-          BACKEND_IPS+=("${resolved_ips[@]}")
-        fi
-      fi
-    done
-
-    if [ ${#BACKEND_IPS[@]} -eq 0 ]; then
-      echo -e "${RED}❌ Error: No valid backend servers found!${NC}"
-      if [ ${#INVALID_SERVERS[@]} -gt 0 ]; then
-        echo -e "${YELLOW}⚠️ Could not resolve: ${INVALID_SERVERS[*]}${NC}"
-      fi
-      continue
-    else
-      break
-    fi
-  done
-
-  echo -e "\n${GREEN}✅ Valid Backend Servers:${NC}"
-  printf '  %s\n' "${BACKEND_IPS[@]}"
-  
-  if [ ${#INVALID_SERVERS[@]} -gt 0 ]; then
-    echo -e "\n${YELLOW}⚠️ Unresolved Servers (skipped):${NC}"
-    printf '  %s\n' "${INVALID_SERVERS[@]}"
+  if [ "$proto" = "udp" ]; then
+    # تست اتصال UDP با timeout
+    timeout 3 bash -c "echo > /dev/udp/$ip/$port" &>/dev/null
+    return $?
+  else
+    # تست اتصال TCP
+    nc -z -w 3 "$ip" "$port" &>/dev/null
+    return $?
   fi
 }
 
-# تابع تولید کانفیگ HAProxy
-generate_haproxy_config() {
-  echo -e "\n${YELLOW}📝 Generating HAProxy configuration...${NC}"
-  
-  # ایجاد فایل کانفیگ با محتوای اصلی
+# تولید فایل کانفیگ HAProxy
+generate_config() {
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
     log /dev/log local0 info
     maxconn 10000
     tune.ssl.default-dh-param 2048
     stats socket /run/haproxy/admin.sock mode 660 level admin
-    stats timeout 30s
     daemon
 
 defaults
     log global
     mode tcp
     option tcplog
-    option dontlognull
     timeout connect 5s
     timeout client 1h
     timeout server 1h
-    retries 3
-    default-server inter 10s downinter 5s rise 2 fall 2 slowstart 60s maxconn 1000 maxqueue 128
 EOF
 
-  # تولید کانفیگ برای هر پروتکل فعال
   for i in "${!PROTOCOLS[@]}"; do
-    if [ "${CONFIG["${PROTOCOLS[i]},enabled"]}" -eq 1 ]; then
-      port=${CONFIG["${PROTOCOLS[i]},port"]}
-      proto=${CONFIG["${PROTOCOLS[i]},proto"]}
-      algo=${ALGORITHMS[i]}
-      sticky=${STICKY_TIMEOUTS[i]}
-
-      echo -e "\n# ${PROTOCOLS[i]} Configuration" >> /etc/haproxy/haproxy.cfg
+    if [ -n "${PORTS[i]}" ]; then
+      proto=${PROTOCOL_TYPES[i]}
+      
       cat >> /etc/haproxy/haproxy.cfg <<EOF
-frontend ${PROTOCOLS[i],,}_front
-    bind *:${port} ${proto}
-    mode ${proto}
-    default_backend ${PROTOCOLS[i],,}_back
 
-backend ${PROTOCOLS[i],,}_back
+frontend ${PROTOCOLS[i]}_front
+    bind *:${PORTS[i]} ${proto}
     mode ${proto}
-    balance ${algo}
-EOF
+    default_backend ${PROTOCOLS[i]}_back
 
-      # تنظیمات پایداری جلسه
-      if [ "$sticky" != "0" ]; then
-        cat >> /etc/haproxy/haproxy.cfg <<EOF
-    stick-table type ip size 200k expire ${sticky}
-    stick on src
+backend ${PROTOCOLS[i]}_back
+    mode ${proto}
+    balance ${ALGORITHMS[i]}
 EOF
-      fi
 
       # تنظیمات خاص OpenVPN
-      if [ "${PROTOCOLS[i]}" == "OpenVPN" ]; then
+      if [ "${PROTOCOLS[i]}" = "OpenVPN" ]; then
         cat >> /etc/haproxy/haproxy.cfg <<EOF
     option tcpka
     timeout tunnel 86400s
 EOF
       fi
 
-      # اضافه کردن سرورهای backend
-      for ip in "${BACKEND_IPS[@]}"; do
-        echo "    server ${PROTOCOLS[i],,}_${ip//./_} ${ip}:${port} check" >> /etc/haproxy/haproxy.cfg
+      # تنظیمات sticky session
+      if [ "${STICKY_TIMEOUTS[i]}" != "0" ]; then
+        cat >> /etc/haproxy/haproxy.cfg <<EOF
+    stick-table type ip size 200k expire ${STICKY_TIMEOUTS[i]}
+    stick on src
+EOF
+      fi
+
+      # اضافه کردن سرورهای فعال
+      active_servers=0
+      for ip in "${BACKEND_SERVERS[@]}"; do
+        if check_server_health "$ip" "${PORTS[i]}" "${PROTOCOL_TYPES[i]}"; then
+          echo "    server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check" >> /etc/haproxy/haproxy.cfg
+          active_servers=$((active_servers+1))
+        else
+          echo "    #server ${PROTOCOLS[i]}_${ip//./_} $ip:${PORTS[i]} check  # INACTIVE" >> /etc/haproxy/haproxy.cfg
+        fi
+      done
+      
+      if [ $active_servers -eq 0 ]; then
+        echo "    server ${PROTOCOLS[i]}_fallback 127.0.0.1:${PORTS[i]} backup" >> /etc/haproxy/haproxy.cfg
+        echo "⚠️ Warning: No active servers found for ${PROTOCOLS[i]}, added fallback server"
+      fi
+
+      # باز کردن پورت در فایروال
+      ufw allow "${PORTS[i]}/${PROTOCOL_TYPES[i]}"
+    fi
+  done
+}
+
+# ریست و بررسی سلامت
+reset_and_check() {
+  echo "🔄 Resetting tunnels and checking servers..."
+
+  for i in "${!PROTOCOLS[@]}"; do
+    if [ -n "${PORTS[i]}" ]; then
+      for ip in "${BACKEND_SERVERS[@]}"; do
+        if ! check_server_health "$ip" "${PORTS[i]}" "${PROTOCOL_TYPES[i]}"; then
+          echo "🚨 Server ${PROTOCOLS[i]}_${ip//./_} is OFFLINE, disabling..."
+          sed -i "/server ${PROTOCOLS[i]}_${ip//./_}/s/^/#/" /etc/haproxy/haproxy.cfg
+        else
+          echo "✅ Server ${PROTOCOLS[i]}_${ip//./_} is ONLINE"
+          sed -i "/#server ${PROTOCOLS[i]}_${ip//./_}/s/^#//" /etc/haproxy/haproxy.cfg
+        fi
       done
     fi
   done
 
-  # نمایش خلاصه کانفیگ
-  echo -e "\n${GREEN}✅ HAProxy configuration generated successfully${NC}"
-  echo -e "${YELLOW}📜 Configuration summary:${NC}"
-  grep -E 'frontend|backend|bind|server' /etc/haproxy/haproxy.cfg | sed 's/^/  /'
+  systemctl restart haproxy
 }
 
-# تابع تنظیم فایروال
-configure_firewall() {
-  echo -e "\n${YELLOW}🔥 Configuring firewall...${NC}"
-  
-  # Reset firewall (برای جلوگیری از تداخل)
-  echo -e "${YELLOW}⚠️ Resetting firewall rules...${NC}"
-  ufw --force reset > /dev/null
-  ufw default deny incoming > /dev/null
-  ufw default allow outgoing > /dev/null
-  
-  # Allow SSH (برای جلوگیری از قفل شدن)
-  ufw allow 22/tcp > /dev/null
-  
-  # Allow HAProxy ports
-  for i in "${!PROTOCOLS[@]}"; do
-    if [ "${CONFIG["${PROTOCOLS[i]},enabled"]}" -eq 1 ]; then
-      port=${CONFIG["${PROTOCOLS[i]},port"]}
-      proto=${CONFIG["${PROTOCOLS[i]},proto"]}
-      ufw allow "${port}/${proto}" > /dev/null
-      echo -e "${GREEN}✅ Allowed ${proto^^} port ${port}${NC}"
-    fi
-  done
-  
-  # Enable firewall
-  ufw --force enable > /dev/null
-  echo -e "\n${GREEN}✅ Firewall configured successfully${NC}"
-  echo -e "${YELLOW}📜 Firewall status:${NC}"
-  ufw status numbered | sed 's/^/  /'
-}
-
-# تابع راه‌اندازی سرویس‌ها
+# تنظیم سرویس‌های خودکار
 setup_services() {
-  echo -e "\n${YELLOW}⚙️ Setting up services...${NC}"
-  
-  # ایجاد سرویس ریست خودکار
-  cat > /etc/systemd/system/haproxy-tunnel.service <<EOF
+  # سرویس ریست دوره‌ای
+  cat > /etc/systemd/system/haproxy-reset.service <<EOF
 [Unit]
-Description=HAProxy Tunnel Service
+Description=HAProxy Reset and Health Check
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/sbin/haproxy -f /etc/haproxy/haproxy.cfg -db
-Restart=always
-RestartSec=5s
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
+Type=oneshot
+ExecStart=/bin/bash -c '$(declare -f reset_and_check); reset_and_check'
 EOF
 
-  # ایجاد تایمر برای ریست دوره‌ای
-  cat > /etc/systemd/system/haproxy-tunnel.timer <<EOF
+  # تایمر 6 ساعته
+  cat > /etc/systemd/system/haproxy-reset.timer <<EOF
 [Unit]
-Description=HAProxy Tunnel Auto-Restart
+Description=HAProxy Reset Timer
 
 [Timer]
 OnBootSec=6h
@@ -348,67 +225,56 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-  # فعال‌سازی سرویس‌ها
+  # سرویس راه‌اندازی خودکار
+  cat > /etc/systemd/system/haproxy-autostart.service <<EOF
+[Unit]
+Description=HAProxy Auto Start
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart haproxy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   systemctl daemon-reload
-  systemctl enable haproxy-tunnel.service haproxy-tunnel.timer > /dev/null
-  systemctl start haproxy-tunnel.service haproxy-tunnel.timer
-  
-  # بررسی وضعیت سرویس
-  echo -e "\n${GREEN}✅ Services configured successfully${NC}"
-  echo -e "${YELLOW}📜 Service status:${NC}"
-  systemctl status haproxy-tunnel.service --no-pager -l | sed 's/^/  /'
+  systemctl enable haproxy-reset.timer haproxy-autostart.service
+  systemctl start haproxy-reset.timer
 }
 
-# تابع نمایش خلاصه نصب
-show_summary() {
-  echo -e "\n${GREEN}🎉 Installation completed successfully!${NC}"
-  echo -e "${YELLOW}📢 Configuration Summary:${NC}"
-  
-  # نمایش پروتکل‌های فعال
-  echo -e "${YELLOW}🔌 Active Protocols:${NC}"
-  for i in "${!PROTOCOLS[@]}"; do
-    if [ "${CONFIG["${PROTOCOLS[i]},enabled"]}" -eq 1 ]; then
-      echo -e "  ${GREEN}✓${NC} ${PROTOCOLS[i]} (Port: ${CONFIG["${PROTOCOLS[i]},port"]}/${CONFIG["${PROTOCOLS[i]},proto"]})"
-    else
-      echo -e "  ${RED}✗${NC} ${PROTOCOLS[i]} (Disabled)"
-    fi
-  done
-  
-  # نمایش سرورهای بک‌اند
-  echo -e "\n${YELLOW}🌐 Backend Servers:${NC}"
-  printf '  %s\n' "${BACKEND_IPS[@]}"
-  
-  # نمایش دستورات مفید
-  echo -e "\n${YELLOW}🔧 Useful Commands:${NC}"
-  echo "  Check HAProxy status: systemctl status haproxy-tunnel.service"
-  echo "  View HAProxy logs: journalctl -u haproxy-tunnel.service -f"
-  echo "  Test OpenVPN connection: nc -zv localhost ${CONFIG["OpenVPN,port"]}"
-  
-  # نمایش نکات مهم
-  echo -e "\n${YELLOW}📢 Important Notes:${NC}"
-  echo "  1. For OpenVPN, ensure your backend servers:"
-  echo "     - Use the same port (${CONFIG["OpenVPN,port"]})"
-  echo "     - Use ${CONFIG["OpenVPN,proto"]} protocol"
-  echo "  2. System will auto-restart every 6 hours for stability"
-  echo "  3. Check firewall status with: ufw status"
-  
-  echo -e "\n${GREEN}🚀 Happy tunneling!${NC}"
-}
+# نصب پیش‌نیازها
+echo "Installing prerequisites..."
+apt update && apt install -y haproxy ufw netcat-openbsd dnsutils
 
-# تابع اصلی
-main() {
-  show_header
-  check_root
-  check_ubuntu_version
-  install_haproxy
-  install_deps
-  configure_protocols
-  get_backend_servers
-  generate_haproxy_config
-  configure_firewall
-  setup_services
-  show_summary
-}
+# بررسی نسخه HAProxy برای پشتیبانی از UDP
+if ! haproxy -v | grep -q "2.4"; then
+  echo "Upgrading HAProxy to version 2.4+ for UDP support..."
+  add-apt-repository -y ppa:vbernat/haproxy-2.4
+  apt update
+  apt install -y haproxy=2.4.*
+fi
 
-# اجرای اسکریپت
-main
+echo "Generating configuration..."
+generate_config
+
+echo "Setting up automatic services..."
+setup_services
+
+systemctl restart haproxy
+systemctl enable haproxy
+ufw --force enable
+
+# نمایش خلاصه نصب
+echo -e "\n🎉 Configuration completed successfully!"
+echo "📋 Active protocols:"
+for i in "${!PROTOCOLS[@]}"; do
+  if [ -n "${PORTS[i]}" ]; then
+    echo "  ${PROTOCOLS[i]}:${PORTS[i]}/${PROTOCOL_TYPES[i]} | Algorithm:${ALGORITHMS[i]} | Sticky:${STICKY_TIMEOUTS[i]}"
+  fi
+done
+echo -e "\n🌐 Backend servers:"
+printf '  %s\n' "${BACKEND_SERVERS[@]}"
+echo -e "\n🔁 Auto-reset every 6 hours enabled"
+echo "🔄 Auto-start after reboot enabled"
